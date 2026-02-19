@@ -1,0 +1,474 @@
+name: ${{ parameters.location }}-${{ parameters.environment }}-${{ parameters.scanMode }}-$(Build.SourceBranchName)-$(Date:yyyyMMdd)-$(Rev:r)
+
+trigger: none
+pr: none
+
+parameters:
+  # AKS Parameters
+  - name: location
+    displayName: 'Choose which location to renew certificates for'
+    type: string
+    values: [inc, eus, we, acl]
+    default: acl
+  
+  - name: environment
+    displayName: 'Environment'
+    type: string
+    values: [dev, demo, uat, rnd]
+    default: dev
+  
+  - name: scanMode
+    displayName: 'Scan Mode'
+    type: string
+    values:
+      - single-namespace
+      - all-namespaces
+    default: single-namespace
+  
+  - name: namespace
+    displayName: 'Kubernetes Namespace (only for single-namespace mode)'
+    type: string
+    default: ' '
+  
+  # Execution Parameters
+  - name: expirationThresholdDays
+    displayName: 'Renew certificates expiring in (days)'
+    type: number
+    default: 30
+  
+  - name: dryRun
+    displayName: 'Dry Run (preview only)'
+    type: boolean
+    default: false
+  
+  - name: forceRestart
+    displayName: 'Force Pod Restart after renewal'
+    type: boolean
+    default: false
+
+stages:
+  - stage: RenewCertificate
+    displayName: 'Renew Certificate'
+    variables:
+      - group: certificate-renewal-keyvault
+    jobs:
+      - job: Renew
+        displayName: 'Renew Certificate'
+        pool:
+          #${{ if or(and(eq(parameters.location, 'acl'), or(eq(parameters.environment, 'dev'), eq(parameters.environment, 'prod'), eq(parameters.environment, 'uat'))), and(eq(parameters.location, 'eus'), or(eq(parameters.environment, 'dev'), eq(parameters.environment, 'prod'), eq(parameters.environment, 'uat'))), and(eq(parameters.location, 'inc'), or(eq(parameters.environment, 'demo'), eq(parameters.environment, 'dev'), eq(parameters.environment, 'prod'), eq(parameters.environment, 'rnd'), eq(parameters.environment, 'uat'))), and(eq(parameters.location, 'we'), or(eq(parameters.environment, 'dev'), eq(parameters.environment, 'prod'), eq(parameters.environment, 'uat')))) }}:
+          #  name: "${{ parameters.location }}-${{ parameters.environment }}-azure-devops-agents"
+          #${{ else }}:
+          #  name: "azure-devops-agent"
+          name: "${{ parameters.location }}-${{ parameters.environment }}-azure-devops-agents"
+          demands:
+            - Agent.OS -equals Windows_NT
+        variables:
+          renewalResult: 'Unknown'
+          # Map environment to subscription (Extraction subscriptions)
+          ${{ if eq(parameters.environment, 'dev') }}:
+            aksSubscriptionId: 'b3646c88-4bed-4c9c-b8f5-5aed67d96d43'
+            aksSubscriptionName: 'ExtractionDev'
+          ${{ if eq(parameters.environment, 'demo') }}:
+            aksSubscriptionId: '07ca991b-a89f-4303-91c7-10bdf7c3fb30'
+            aksSubscriptionName: 'ExtractionDemo'
+          ${{ if eq(parameters.environment, 'rnd') }}:
+            aksSubscriptionId: '46b8afce-66eb-4ee6-9ac5-5e430b8a9360'
+            aksSubscriptionName: 'ExtractionRnD'
+          ${{ if eq(parameters.environment, 'uat') }}:
+            aksSubscriptionId: '3116030c-1e45-4f3b-833b-255df41cbfea'
+            aksSubscriptionName: 'ExtractionUAT'
+          ${{ if eq(parameters.environment, 'prod') }}:
+            aksSubscriptionId: 'EXTRACTION_PROD_SUBSCRIPTION_ID_NOT_PROVIDED'
+            aksSubscriptionName: 'ExtractionProd'
+          # Auto-generate Resource Group and Cluster names
+          aksResourceGroup: '${{ parameters.location }}-${{ parameters.environment }}-core-rg'
+          aksClusterName: '${{ parameters.location }}-${{ parameters.environment }}-core-aks'
+        steps:
+          - checkout: self
+          
+          - task: PowerShell@2
+            displayName: 'Display Parameters'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "============================================================" -ForegroundColor Cyan
+                Write-Host "Certificate Renewal Parameters" -ForegroundColor Cyan
+                Write-Host "============================================================" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "AKS Configuration:" -ForegroundColor Yellow
+                Write-Host "  Subscription:     $(aksSubscriptionName) ($(aksSubscriptionId))"
+                Write-Host "  Resource Group:   $(aksResourceGroup)"
+                Write-Host "  Cluster:          $(aksClusterName)"
+                Write-Host "  Scan Mode:        ${{ parameters.scanMode }}"
+                if ('${{ parameters.scanMode }}' -eq 'single-namespace') {
+                  Write-Host "  Namespace:        ${{ parameters.namespace }}"
+                } else {
+                  Write-Host "  Namespace:        ALL (excluding system namespaces)"
+                }
+                Write-Host ""
+                Write-Host "Key Vault Configuration:" -ForegroundColor Yellow
+                Write-Host "  Subscription:       $(keyVaultSubscriptionId)"
+                Write-Host "  Resource Group:     $(keyVaultResourceGroup)"
+                Write-Host "  Key Vault:          $(keyVaultName)"
+                Write-Host "  Certificate Secret: $(certificateSecretName)"
+                Write-Host "  Key Secret:         $(keySecretName)"
+                Write-Host ""
+                Write-Host "Execution Options:" -ForegroundColor Yellow
+                Write-Host "  Expiration Threshold: ${{ parameters.expirationThresholdDays }} days"
+                Write-Host "  Dry Run:              ${{ parameters.dryRun }}"
+                Write-Host "  Force Restart:    ${{ parameters.forceRestart }}"
+                Write-Host ""
+                Write-Host "============================================================" -ForegroundColor Cyan
+          
+          - task: PowerShell@2
+            displayName: 'Authenticate with Managed Identity'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Authenticating with Managed Identity..." -ForegroundColor Yellow
+                az login --identity
+                
+                Write-Host ""
+                Write-Host "Verifying access to subscriptions..." -ForegroundColor Yellow
+                Write-Host ""
+                
+                # Check AKS subscription
+                Write-Host "AKS Subscription:" -ForegroundColor Cyan
+                az account set --subscription $(aksSubscriptionId)
+                az account show --query "{Name:name, ID:id, TenantId:tenantId}" -o table
+                
+                # Check Key Vault subscription
+                Write-Host ""
+                Write-Host "Key Vault Subscription:" -ForegroundColor Cyan
+                az account set --subscription $(keyVaultSubscriptionId)
+                az account show --query "{Name:name, ID:id, TenantId:tenantId}" -o table
+                
+                Write-Host ""
+                Write-Host "Successfully authenticated to both subscriptions" -ForegroundColor Green
+          
+          - task: PowerShell@2
+            displayName: 'Install kubectl and kubelogin'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Installing kubectl and kubelogin..." -ForegroundColor Yellow
+                az aks install-cli --install-location "C:\kubectl\kubectl.exe" --kubelogin-install-location "C:\kubectl\kubelogin.exe"
+                
+                # Add to PATH for current session
+                $env:PATH = "C:\kubectl;$env:PATH"
+                
+                Write-Host "kubectl version:" -ForegroundColor Cyan
+                kubectl version --client --short
+                
+                Write-Host "kubelogin version:" -ForegroundColor Cyan
+                kubelogin --version
+                
+                Write-Host "kubectl and kubelogin installed successfully" -ForegroundColor Green
+          
+          - task: PowerShell@2
+            displayName: 'Configure kubectl for AKS'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Configuring kubectl for AKS cluster..." -ForegroundColor Yellow
+                Write-Host ""
+                
+                # Add kubectl to PATH
+                $env:PATH = "C:\kubectl;$env:PATH"
+                
+                # Switch to AKS subscription
+                az account set --subscription $(aksSubscriptionId)
+                
+                # Get AKS credentials
+                az aks get-credentials `
+                  --resource-group $(aksResourceGroup) `
+                  --name $(aksClusterName) `
+                  --overwrite-existing
+                
+                Write-Host ""
+                Write-Host "Converting kubeconfig to use kubelogin..." -ForegroundColor Cyan
+                kubelogin convert-kubeconfig -l azurecli
+                
+                Write-Host ""
+                Write-Host "Verifying kubectl access..." -ForegroundColor Cyan
+                kubectl config current-context
+                kubectl get nodes
+                
+                Write-Host ""
+                Write-Host "kubectl configured successfully" -ForegroundColor Green
+          
+          - task: PowerShell@2
+            displayName: 'Install PowerShell Core'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Check if PowerShell Core is already installed
+                if (Get-Command pwsh -ErrorAction SilentlyContinue) {
+                  Write-Host "PowerShell Core is already installed" -ForegroundColor Green
+                  pwsh -Version
+                  exit 0
+                }
+                
+                Write-Host "Installing PowerShell Core..." -ForegroundColor Yellow
+                
+                # Download and install PowerShell Core 7.4 (LTS)
+                $version = "7.4.6"
+                $msiUrl = "https://github.com/PowerShell/PowerShell/releases/download/v$version/PowerShell-$version-win-x64.msi"
+                $msiPath = "$env:TEMP\PowerShell-$version-win-x64.msi"
+                
+                Write-Host "Downloading PowerShell Core $version..." -ForegroundColor Cyan
+                Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
+                
+                Write-Host "Installing PowerShell Core..." -ForegroundColor Cyan
+                Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", $msiPath, "/quiet", "/norestart" -Wait -NoNewWindow
+                
+                # Add to PATH for current session
+                $pwshPath = "C:\Program Files\PowerShell\7"
+                if (Test-Path $pwshPath) {
+                  $env:PATH = "$pwshPath;$env:PATH"
+                  Write-Host "PowerShell Core installed successfully" -ForegroundColor Green
+                  & "$pwshPath\pwsh.exe" -Version
+                } else {
+                  Write-Host "ERROR: PowerShell Core installation failed" -ForegroundColor Red
+                  exit 1
+                }
+              pwsh: false
+          
+          - task: PowerShell@2
+            name: renewCertificates
+            displayName: 'Renew Expiring Certificates'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Add kubectl to PATH
+                $env:PATH = "C:\kubectl;$env:PATH"
+                
+                $pwshPath = "C:\Program Files\PowerShell\7\pwsh.exe"
+                if (-not (Test-Path $pwshPath)) {
+                  Write-Host "ERROR: PowerShell Core not found at: $pwshPath" -ForegroundColor Red
+                  exit 1
+                }
+                
+                $scriptPath = Join-Path "$(Build.SourcesDirectory)" "aks-certificate-renewal\scripts\renew-expiring-certificates.ps1"
+                
+                if (-not (Test-Path $scriptPath)) {
+                  Write-Host "ERROR: Script not found at: $scriptPath" -ForegroundColor Red
+                  exit 1
+                }
+                
+                # Build script arguments
+                $scriptArgs = @(
+                  "-KeyVaultName", '$(keyVaultName)',
+                  "-CertificateSecretName", '$(certificateSecretName)',
+                  "-KeySecretName", '$(keySecretName)',
+                  "-KeyVaultSubscriptionId", '$(keyVaultSubscriptionId)',
+                  "-ExpirationThresholdDays", '${{ parameters.expirationThresholdDays }}'
+                )
+                
+                # Add namespace or AllNamespaces flag based on scan mode
+                $scanMode = '${{ parameters.scanMode }}'
+                $namespace = '${{ parameters.namespace }}'.Trim()
+                
+                Write-Host "Scan Mode: $scanMode" -ForegroundColor Cyan
+                Write-Host "Namespace parameter: [$namespace]" -ForegroundColor Cyan
+                
+                if ($scanMode -eq 'single-namespace') {
+                  if (-not [string]::IsNullOrWhiteSpace($namespace)) {
+                    $scriptArgs += "-Namespace", $namespace
+                    Write-Host "Adding -Namespace $namespace" -ForegroundColor Green
+                  } else {
+                    Write-Host "ERROR: Namespace is required when scanMode is single-namespace" -ForegroundColor Red
+                    exit 1
+                  }
+                } elseif ($scanMode -eq 'all-namespaces') {
+                  $scriptArgs += "-AllNamespaces"
+                  Write-Host "Adding -AllNamespaces flag" -ForegroundColor Green
+                } else {
+                  Write-Host "ERROR: Invalid scanMode: $scanMode" -ForegroundColor Red
+                  exit 1
+                }
+                
+                if ('${{ parameters.dryRun }}' -eq 'True') {
+                  $scriptArgs += "-DryRun"
+                }
+                
+                if ('${{ parameters.forceRestart }}' -eq 'True') {
+                  $scriptArgs += "-ForceRestart"
+                }
+                
+                Write-Host "Running PowerShell Core script: $scriptPath" -ForegroundColor Cyan
+                Write-Host "Arguments: $($scriptArgs -join ' ')" -ForegroundColor Yellow
+                
+                try {
+                  & $pwshPath -File $scriptPath @scriptArgs
+                  if ($LASTEXITCODE -eq 0) {
+                    Write-Host "##vso[task.setvariable variable=renewalResult;isOutput=true]Succeeded"
+                  } else {
+                    Write-Host "##vso[task.setvariable variable=renewalResult;isOutput=true]Failed"
+                    exit 1
+                  }
+                } catch {
+                  Write-Host "##vso[task.setvariable variable=renewalResult;isOutput=true]Failed"
+                  throw
+                }
+              pwsh: false
+          
+          - task: PowerShell@2
+            displayName: 'Verify Certificate Update'
+            condition: and(succeeded(), eq('${{ parameters.dryRun }}', false))
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Add kubectl to PATH
+                $env:PATH = "C:\kubectl;$env:PATH"
+                
+                $pwshPath = "C:\Program Files\PowerShell\7\pwsh.exe"
+                $scriptPath = Join-Path "$(Build.SourcesDirectory)" "aks-certificate-renewal\scripts\check-tls.ps1"
+                Write-Host "Running verification script: $scriptPath" -ForegroundColor Cyan
+                
+                if ('${{ parameters.scanMode }}' -eq 'single-namespace') {
+                  & $pwshPath -File $scriptPath -Namespace '${{ parameters.namespace }}'
+                } else {
+                  & $pwshPath -File $scriptPath -AllNamespaces
+                }
+              pwsh: false
+
+  - stage: Notification
+    displayName: 'Send Notification'
+    dependsOn: RenewCertificate
+    condition: always()
+    variables:
+      - group: certificate-renewal-keyvault
+    jobs:
+      - job: Notify
+        displayName: 'Send Status Notification'
+        pool:
+          #name: 'azure-devops-agent'
+          name: "${{ parameters.location }}-${{ parameters.environment }}-azure-devops-agents"
+          demands:
+            - Agent.OS -equals Windows_NT
+        variables:
+          renewStatus: $[ stageDependencies.RenewCertificate.Renew.result ]
+          renewalMode: $[ stageDependencies.RenewCertificate.Renew.outputs['renewCertificates.renewalMode'] ]
+          secretsToRenew: $[ stageDependencies.RenewCertificate.Renew.outputs['renewCertificates.secretsToRenew'] ]
+          secretsRenewed: $[ stageDependencies.RenewCertificate.Renew.outputs['renewCertificates.secretsRenewed'] ]
+          namespacesAffected: $[ stageDependencies.RenewCertificate.Renew.outputs['renewCertificates.namespacesAffected'] ]
+          secretDetails: $[ stageDependencies.RenewCertificate.Renew.outputs['renewCertificates.secretDetails'] ]
+        steps:
+          - task: PowerShell@2
+            displayName: 'Build Summary'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $status = "$(renewStatus)"
+                $mode = "$(renewalMode)"
+                $toRenew = "$(secretsToRenew)"
+                $renewed = "$(secretsRenewed)"
+                $namespacesAffected = "$(namespacesAffected)"
+                $secretDetails = "$(secretDetails)"
+                $namespace = "${{ parameters.namespace }}"
+                $scanMode = "${{ parameters.scanMode }}"
+                $certificateSecret = "$(certificateSecretName)"
+                $keySecret = "$(keySecretName)"
+                $dryRun = '${{ parameters.dryRun }}'
+                $buildUrl = "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                $location = "${{ parameters.location }}"
+                $environment = "${{ parameters.environment }}"
+                
+                # Map environment to subscription name
+                $subscriptionName = switch ($environment) {
+                  'dev'  { 'ExtractionDev' }
+                  'demo' { 'ExtractionDemo' }
+                  'rnd'  { 'ExtractionRnD' }
+                  'uat'  { 'ExtractionUAT' }
+                  'prod' { 'ExtractionProd' }
+                  default { 'Unknown' }
+                }
+                
+                Write-Host "============================================================"
+                Write-Host "Certificate Renewal Summary"
+                Write-Host "============================================================"
+                Write-Host "Status:         $status"
+                Write-Host "Location:       $($location.ToUpper())"
+                Write-Host "Environment:    $($environment.ToUpper())"
+                Write-Host "Subscription:   $subscriptionName"
+                if ($scanMode -eq 'all-namespaces') {
+                  Write-Host "Scan Mode:      ALL NAMESPACES"
+                  if ($namespacesAffected) {
+                    Write-Host "Namespaces:     $namespacesAffected"
+                  }
+                } else {
+                  Write-Host "Scan Mode:      Single Namespace"
+                  Write-Host "Namespace:      $namespace"
+                }
+                Write-Host "Cert Secret:    $certificateSecret"
+                Write-Host "Key Secret:     $keySecret"
+                Write-Host "Build URL:      $buildUrl"
+                Write-Host "============================================================"
+                Write-Host ""
+                
+                if ($status -ne "Succeeded") {
+                  Write-Host "Certificate renewal failed. Check logs for details." -ForegroundColor Red
+                  exit 1
+                }
+                
+                # Determine what happened and show appropriate message
+                if ($dryRun -eq 'True' -or $mode -eq 'DryRun') {
+                  Write-Host "DRY RUN MODE - No changes were made" -ForegroundColor Cyan
+                  Write-Host ""
+                  Write-Host "Certificates found expiring within threshold: $toRenew" -ForegroundColor Yellow
+                  Write-Host "These certificates WOULD be renewed in a real execution." -ForegroundColor Yellow
+                  Write-Host ""
+                  
+                  # Display details of secrets that would be renewed
+                  if ($secretDetails) {
+                    Write-Host "Secrets that would be renewed:" -ForegroundColor Yellow
+                    $secrets = $secretDetails -split ','
+                    foreach ($secret in $secrets) {
+                      Write-Host "  - $secret" -ForegroundColor White
+                    }
+                    Write-Host ""
+                  }
+                  
+                  Write-Host "To perform actual renewal, run the pipeline with 'Dry Run' = false" -ForegroundColor Cyan
+                  exit 0
+                } elseif ($mode -eq 'NoCertsNeeded') {
+                  Write-Host "No certificates need renewal" -ForegroundColor Green
+                  Write-Host ""
+                  if ($scanMode -eq 'all-namespaces') {
+                    Write-Host "All certificates in all scanned namespaces are valid" -ForegroundColor Green
+                    Write-Host "for more than ${{ parameters.expirationThresholdDays }} days, or no TLS certificates found." -ForegroundColor Green
+                  } else {
+                    Write-Host "All certificates in namespace '$namespace' are valid" -ForegroundColor Green
+                    Write-Host "for more than ${{ parameters.expirationThresholdDays }} days, or no TLS certificates found." -ForegroundColor Green
+                  }
+                  exit 0
+                } elseif ($mode -eq 'Renewed') {
+                  if ($renewed -gt 0) {
+                    Write-Host "Certificate renewal completed successfully!" -ForegroundColor Green
+                    Write-Host ""
+                    Write-Host "Certificates requiring renewal: $toRenew" -ForegroundColor White
+                    Write-Host "Certificates renewed:           $renewed" -ForegroundColor Green
+                    Write-Host ""
+                    
+                    # Display details of renewed secrets
+                    if ($secretDetails) {
+                      Write-Host "Renewed secrets:" -ForegroundColor Yellow
+                      $secrets = $secretDetails -split ','
+                      foreach ($secret in $secrets) {
+                        Write-Host "  - $secret" -ForegroundColor White
+                      }
+                    }
+                  } else {
+                    Write-Host "WARNING: Renewal process executed but no certificates were updated" -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host "Certificates requiring renewal: $toRenew" -ForegroundColor White
+                    Write-Host "Certificates renewed:           $renewed" -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host "This may indicate an issue. Check logs for details." -ForegroundColor Yellow
+                  }
+                  exit 0
+                } else {
+                  Write-Host "Certificate renewal process completed" -ForegroundColor Green
+                  exit 0
+                }
